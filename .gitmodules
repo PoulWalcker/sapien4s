@@ -1,0 +1,8 @@
+[submodule "blindly4"]
+	path = submodules/blindly4
+	url = ../blindly4.git
+	branch = main
+[submodule "libs4"]
+	path = submodules/libs4
+	url = ../libs4.git
+	branch = main

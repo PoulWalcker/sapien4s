@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Logs
+*.log
+
+# Local UI database, runtime state, agent artifacts and Python caches
+.sapiens4/
+.agentpy/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+__pycache__/
+.venv/
+.test-output/
+
+# Optional frontend build dependencies
+node_modules/
+
+# Windows build output
+environments/windows/bin/
+environments/windows/obj/
+
+# Local RSpec results and Ruby dependencies
+tmp/
+.bundle/
+vendor/bundle/
+spec/support/windows/bin/
+spec/support/windows/obj/
+spec/support/windows_accessibility/bin/
+spec/support/windows_accessibility/obj/
