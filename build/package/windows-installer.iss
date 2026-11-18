@@ -11,7 +11,13 @@ ArchitecturesInstallIn64BitMode={#PackageArchitecture}
 MinVersion=10.0
 DisableDirPage=yes
 DisableProgramGroupPage=yes
+#ifdef StagePayload
+UsePreviousAppDir=no
+Uninstallable=no
+CreateUninstallRegKey=no
+#else
 UsePreviousAppDir=yes
+#endif
 OutputDir={#OutputDir}
 OutputBaseFilename={#ArtifactBaseName}
 Compression=lzma2/fast
@@ -28,14 +34,28 @@ SignedUninstaller=no
 #endif
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sapiens-installation.id"; Flags: ignoreversion recursesubdirs createallsubdirs
+#ifdef StagePayload
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sapiens-installation.id,sapiens-starter.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sapiens-installation.id"; DestDir: "{app}"; Flags: ignoreversion
+#else
+Source: "{#SourceDir}\*"; DestDir: "{app}\versions\{#InitialVersion}"; Excludes: "sapiens-starter.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\sapiens-starter.exe"; DestDir: "{app}"; DestName: "Sapiens4.exe"; Flags: ignoreversion
+Source: "{#SourceDir}\sapiens-installation.id"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 
+#ifndef StagePayload
 [Icons]
 Name: "{userprograms}\{#PackageName}"; Filename: "{app}\Sapiens4.exe"
 
 [Run]
 Filename: "{app}\Sapiens4.exe"; Description: "Launch {#PackageName}"; Flags: nowait postinstall skipifsilent unchecked
+
+[UninstallDelete]
+Type: files; Name: "{app}\installation.lock"
+Type: dirifempty; Name: "{app}\backups"
+Type: dirifempty; Name: "{app}\versions"
+
+#endif
 
 [Code]
 const
@@ -79,7 +99,10 @@ begin
     StateRoot := AddBackslash(ExpandFileName(GetEnv('SAPIENS_CONFIG_DIR')));
     if CompareText(Copy(Target, 1, Length(StateRoot)), StateRoot) = 0 then begin Result := False; Exit; end;
   end;
+#ifndef StagePayload
+  if FileExists(ExpandConstant('{app}\update-state.json')) then begin Result := False; Exit; end;
   if OwnedDirectory then Exit;
+#endif
   if FindFirst(Target + '*', Item) then begin
     try
       repeat
@@ -191,6 +214,12 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+#ifdef StagePayload
+  if ExpandConstant('{param:DIR|}') = '' then begin
+    Result := 'Payload staging requires an explicit new /DIR destination.';
+    Exit;
+  end;
+#endif
   if not SafeDestination then
     Result := 'Choose a new installation directory. Existing data or unowned files cannot be replaced.'
   else if not ProcessesStopped(False) then
@@ -201,8 +230,27 @@ function InitializeUninstall: Boolean;
 begin
   Result := OwnedDirectory and ProcessesStopped(True);
   if not Result then begin
-    Log('Uninstall refused: missing installation identity, running process, or process-check failure.');
+    Log('Uninstall refused: the installation is active, recovery is pending, or cleanup could not complete.');
     if not UninstallSilent then
-      MsgBox('Quit {#PackageName} and its backend, then retry uninstall. No running process will be stopped.', mbError, MB_OK);
+      MsgBox('Finish any interrupted update and quit {#PackageName}, then retry uninstall.', mbError, MB_OK);
   end;
 end;
+
+#ifndef StagePayload
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var Code: Integer;
+begin
+  if CurUninstallStep = usUninstall then
+    if not Exec(ExpandConstant('{app}\Sapiens4.exe'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+      RaiseException('Finish any interrupted Sapiens update and quit the app before uninstalling.');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var Code: Integer;
+begin
+  if CurStep = ssPostInstall then begin
+    if not Exec(ExpandConstant('{app}\Sapiens4.exe'), '--initialize {#InitialVersion}', '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+      RaiseException('Sapiens installation could not publish its initial version.');
+  end;
+end;
+#endif

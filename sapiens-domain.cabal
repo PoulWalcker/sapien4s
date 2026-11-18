@@ -8,6 +8,11 @@ flag linux-desktop
   default: False
   manual: True
 
+flag update-fixture
+  description: Isolated updater fixture build; never publish
+  default: False
+  manual: True
+
 common runtime
   default-language: Haskell2010
   default-extensions: OverloadedStrings, ScopedTypeVariables, TupleSections
@@ -17,6 +22,8 @@ common runtime
     sqlite-simple, filelock, uuid, base64-bytestring, network-uri, regex-tdfa,
     http-client, http-client-tls, http-types, network, wai, warp, wai-websockets,
     websockets, wuss, cryptohash-sha256, entropy, memory, random, tagsoup ==0.14.8
+  if flag(update-fixture)
+    cpp-options: -DUPDATE_FIXTURE
   if !os(windows)
     build-depends: unix
 
@@ -28,10 +35,19 @@ executable sapiens-domain
   default-language: Haskell2010
   ghc-options: -O2 -Wall -Werror
 
+common macos-update
+  if os(osx)
+    other-modules: Installation, UpdatePlatform
+    c-sources: environments/macos/Update.c, environments/macos/Desktop.m
+    frameworks: Cocoa
+    cc-options: -Wno-deprecated-declarations
+
 common host
-  hs-source-dirs: corpora, corpora/state, corpora/work, corpora/work/schedule, corpora/host, corpora/telemetry, remote/relay, remote/control, remote/protocol, build
+  import: macos-update
+  hs-source-dirs: corpora, corpora/state, corpora/work, corpora/work/schedule, corpora/host, corpora/telemetry, remote/relay, remote/control, remote/protocol, build, environments/update
   other-modules:
     Command,
+    Admission,
     Domain,
     RuntimePaths,
     Telemetry,
@@ -39,6 +55,7 @@ common host
     TelemetryWire,
     Paths_sapiens_domain,
     DataRoot,
+    UpdateState,
     Assets,
     BuildUI,
     Computer,
@@ -73,6 +90,14 @@ common host
     Voice,
     Workspace,
     Wire
+  if os(windows)
+    hs-source-dirs: environments/windows
+    other-modules: Installation, UpdatePlatform
+    c-sources: environments/windows/Update.c
+    extra-libraries: user32, advapi32, bcrypt
+
+  if os(osx)
+    hs-source-dirs: environments/macos
 
 executable sapiens4
   import: runtime, host
@@ -90,9 +115,10 @@ executable sapiens-linux
     buildable: False
 
 executable sapiens-macos
-  import: runtime
-  hs-source-dirs: environments/macos, environments, corpora/state, corpora/telemetry
+  import: runtime, macos-update
+  hs-source-dirs: environments/macos, environments, environments/update, corpora/state, corpora/telemetry
   other-modules:
+    Admission,
     Domain,
     RuntimePaths,
     Telemetry,
@@ -100,23 +126,38 @@ executable sapiens-macos
     TelemetryWire,
     Paths_sapiens_domain,
     DataRoot,
+    UpdateState,
     DesktopStorage,
     Types,
     Application,
     Browser,
     Icon,
-    ObjC
+    ObjC,
+    Update,
+    UpdateBackup
   main-is: MacMain.hs
   if os(osx)
     c-sources: environments/macos/Cocoa.c, environments/macos/Process.c
-    frameworks: Cocoa, WebKit, CoreGraphics
+    frameworks: WebKit, CoreGraphics
     extra-libraries: objc
   else
+    buildable: False
+
+executable sapiens-macos-starter
+  import: runtime, macos-update
+  hs-source-dirs: environments/macos, environments/update
+  main-is: Starter.hs
+  other-modules: UpdateState
+  if !os(osx)
     buildable: False
 
 common windows-host
   import: runtime
   other-modules:
+    Installation,
+    UpdateState,
+    UpdatePlatform,
+    Admission,
     Domain,
     RuntimePaths,
     Telemetry,
@@ -130,17 +171,31 @@ common windows-host
     Host,
     Native,
     Navigation,
-    Shell
+    Shell,
+    Update,
+    UpdateBackup
   if os(windows)
-    c-sources: environments/windows/WebView.c
-    extra-libraries: user32, ole32, dwmapi, comdlg32, kernel32
+    c-sources: environments/windows/WebView.c, environments/windows/Update.c
+    extra-libraries: user32, ole32, dwmapi, comdlg32, kernel32, advapi32, bcrypt
   else
     buildable: False
 
 executable sapiens-windows
   import: windows-host
-  hs-source-dirs: environments/windows, environments, corpora/state, corpora/telemetry
+  hs-source-dirs: environments/windows, environments, environments/update, corpora/state, corpora/telemetry
   main-is: WindowsMain.hs
   if os(windows)
     ld-options: .build/haskell/windows-resources.o
     ghc-options: -optl-mwindows
+
+executable sapiens-starter
+  import: runtime
+  hs-source-dirs: environments/windows, environments/update
+  main-is: Starter.hs
+  other-modules: Installation, UpdateState, UpdatePlatform
+  if os(windows)
+    c-sources: environments/windows/Update.c
+    extra-libraries: user32, advapi32, bcrypt
+    ghc-options: -optl-mwindows
+  else
+    buildable: False

@@ -2,6 +2,7 @@
 module Registry where
 
 import Types
+import Admission (admissionOpen)
 import qualified Telemetry
 import DataRoot
 import System.FileLock (unlockFile)
@@ -11,6 +12,7 @@ import Client
 import Crypto (confirmationCode)
 import Setup
 import Control.Concurrent
+import Control.Concurrent.Async (Async, async, cancel, poll)
 import Control.Exception
 import Control.Monad
 import Data.Aeson hiding (pairs)
@@ -37,6 +39,7 @@ data Registry = Registry
  , registryPending :: IORef (M.Map Text Pairing)
  , registryPairClients :: IORef (M.Map Text Client)
  , registryClosed :: IORef Bool
+ , registryCleanup :: MVar (Maybe (Async ()))
  }
 
 registryPath :: Registry -> FilePath
@@ -54,8 +57,7 @@ newRegistry service bridge openChild = do
  identity <- Service.corporaIdentity service
  registry <- Registry service bridge openChild <$> newMVar () <*> newIORef saved
    <*> newIORef (M.singleton (at identity "id") (service,bridge,pure ())) <*> newIORef M.empty
-   <*> newIORef M.empty <*> newIORef M.empty <*> newIORef False
- unless (null $ items saved "relay_cleanup") $ void $ forkIO $ registryLock registry $ cleanupRelays registry Nothing Nothing
+   <*> newIORef M.empty <*> newIORef M.empty <*> newIORef False <*> newMVar Nothing
  pure registry
 
 local :: Registry -> Text -> IO (Service, Bridge, IO ())
@@ -96,6 +98,8 @@ registryRoute registry identity method path input = do
  target <- registryLock registry $ do
   saved <- readIORef (registrySaved registry)
   if has (get saved "remotes") identity then do
+   admissionOpen (serviceAdmission (registryService registry)) >>= \open ->
+    require open 503 "Remote Corpora are unavailable until startup completes"
    cache <- readIORef (registryClients registry)
    client <- case M.lookup identity cache of
     Just value -> pure value
@@ -148,7 +152,7 @@ remoteAction registry bridge path input = registryLock registry $ do
     connection <- selectedConnection registry
     require (boolean (get input "saved") && not (boolean $ get input "local")) 409 "Choose the relay in Remote Control Relay Servers."
     identity <- Service.corporaIdentity (bridgeService bridge)
-    cleanupRelays registry (Just $ at connection "relay") (Just $ at identity "id")
+    cleanupRelays id registry (Just $ at connection "relay") (Just $ at identity "id")
     createPairing bridge connection
    else createPairing bridge input
   "/api/remote/approve" -> approvePairing bridge input
@@ -262,6 +266,7 @@ pairing registry identity cancelPairing = registryLock registry $ do
 closeRegistry :: Registry -> IO ()
 closeRegistry registry = do
  writeIORef (registryClosed registry) True
+ modifyMVar_ (registryCleanup registry) $ \task -> mapM_ cancel task >> pure Nothing
  clients <- readIORef (registryClients registry)
  pending <- readIORef (registryPairClients registry)
  mapM_ revokeClient (M.elems clients ++ M.elems pending)
@@ -406,16 +411,18 @@ queueRelayCleanup registry = do
   if all (has config) ["relay","room","token"] then pure $ Just $ obj [("relay",get config "relay"),("room",get config "room"),("token",get config "token"),("corpora_id",fallback (get config "corpora_id") $ str key)] else pure Nothing) `catch` \(_::SomeException) -> pure Nothing
  writeIORef (registrySaved registry) $ put "relay_cleanup" (arr $ nub $ items saved "relay_cleanup" ++ catMaybes entries) saved
 
-cleanupRelays :: Registry -> Maybe Text -> Maybe Text -> IO ()
-cleanupRelays registry relay identity = do
+cleanupRelays :: (IO () -> IO ()) -> Registry -> Maybe Text -> Maybe Text -> IO ()
+cleanupRelays save registry relay identity = do
  saved <- readIORef (registrySaved registry)
  forM_ (items saved "relay_cleanup") $ \item -> when (maybe True (== at item "relay") relay && maybe True (== at item "corpora_id") identity) $ do
   closed <- readIORef (registryClosed registry)
   unless closed $ do
    deleted <- deleteRoom item
-   when deleted $ do
-    modifyIORef' (registrySaved registry) $ \current -> put "relay_cleanup" (arr $ filter (/=item) $ items current "relay_cleanup") current
-    saveRegistry registry
+   when deleted $ save $ do
+    current <- readIORef (registrySaved registry)
+    when (item `elem` items current "relay_cleanup") $ do
+     writeIORef (registrySaved registry) $ put "relay_cleanup" (arr $ filter (/=item) $ items current "relay_cleanup") current
+     saveRegistry registry
 
 resetConnections :: Registry -> Value -> IO ()
 resetConnections registry connection = do
@@ -429,4 +436,15 @@ resetConnections registry connection = do
  let unopened=filter (`M.notMember` opened) (map text $ items saved "locals")
  withSavedCorporaLocks (serviceRoot $ registryService registry) unopened $
   resetSavedConnections (serviceRoot $ registryService registry) (items saved "locals") connection
- void $ forkIO $ registryLock registry $ cleanupRelays registry Nothing Nothing
+ startRegistry registry
+
+startRegistry :: Registry -> IO ()
+startRegistry registry = modifyMVar_ (registryCleanup registry) $ \old -> do
+ running <- maybe (pure False) (fmap isNothing . poll) old
+ closed <- readIORef (registryClosed registry)
+ saved <- readIORef (registrySaved registry)
+ if running || closed || null (items saved "relay_cleanup") then pure old
+ else Just <$> async (cleanupRelays (registryLock registry) registry Nothing Nothing)
+
+prepareRegistry :: Registry -> IO ()
+prepareRegistry registry = void (registryRecords registry)
