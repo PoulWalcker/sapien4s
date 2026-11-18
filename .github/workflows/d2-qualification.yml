@@ -1,0 +1,148 @@
+name: D2 qualification packages and release promotion
+
+on:
+  push:
+    branches:
+      - 'codex/d2-build-v*'
+      - 'codex/d2-publish-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    if: github.repository == 'PoulWalcker/sapien4s' && startsWith(github.ref_name, 'codex/d2-build-v')
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          submodules: recursive
+      - uses: haskell-actions/setup@82e8b5066385702e477d9dc98f287070493e8abd
+        with:
+          ghc-version: '9.14.1'
+          cabal-version: '3.18.2.0'
+          cabal-update: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.2'
+      - name: Validate qualification tag and prepare native tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${GITHUB_REF_NAME#codex/d2-build-v}
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$(cat build/d2-qa-version.txt)" == "$version" ]]
+          printf 'PACKAGE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          git submodule status --recursive
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup override set 1.99.0
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: |
+            .build/cabal/store
+            .build/cabal/packages
+          key: d2-qa-mac-arm64-ghc9141-${{ hashFiles('build/dependencies/cabal.project.freeze', 'build/cabal.project') }}
+      - name: Configure the build dependency index
+        shell: python
+        run: |
+          from pathlib import Path
+          cache = Path(".build/cabal")
+          cache.mkdir(parents=True, exist_ok=True)
+          (cache / "config").write_text(
+              "repository hackage.haskell.org\n  url: https://hackage.haskell.org/\n  secure: True\n",
+              encoding="ascii",
+          )
+      - name: Build full macOS DMG and updater payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --package-lock=false --include=dev --prefix build/dependencies
+          ./environments/macos/build.sh "$PACKAGE_VERSION" .build/d2-qa-products
+      - name: Verify artifacts and record provenance
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          out = Path(".build/d2-qa-products")
+          platform = "mac-arm64"
+          names = {"Sapiens.dmg", "Sapiens-Payload-mac-arm64.dmg"}
+          sums = dict(line.split()[::-1] for line in (out / "SHA256SUMS").read_text().splitlines())
+          assert set(sums) == set(names)
+          for name in names:
+              with (out / name).open("rb") as asset:
+                  assert hashlib.file_digest(asset, "sha256").hexdigest() == sums[name]
+          native = Path(".build/bin") / "sapiens-macos"
+          with native.open("rb") as native_file:
+              native_digest = hashlib.file_digest(native_file, "sha256").hexdigest()
+          version = os.environ["PACKAGE_VERSION"]
+          provenance = dict(
+              version=version, platform=platform, source=os.environ["GITHUB_SHA"],
+              baseline=subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip(),
+              run_id=os.environ["GITHUB_RUN_ID"], run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
+              signing="ad hoc",
+              compiler="GHC 9.14.1", cabal="3.18.2.0", rust="1.99.0", node="22.23.2",
+              native_executable_sha256=native_digest, assets=sums,
+          )
+          (out / "SHA256SUMS").rename(out / f"SHA256SUMS-{platform}")
+          (out / f"provenance-{platform}.json").write_text(json.dumps(provenance, indent=2) + "\n")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: packages-mac-arm64
+          path: .build/d2-qa-products/*
+          if-no-files-found: error
+          retention-days: 14
+
+  draft:
+    if: github.repository == 'PoulWalcker/sapien4s' && startsWith(github.ref_name, 'codex/d2-build-v')
+    needs: native
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish the CI packages to an isolated draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#codex/d2-build-}
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name packages-mac-arm64 --dir release-assets
+          (cd release-assets &&
+           sha256sum -c SHA256SUMS-mac-arm64 &&
+           jq -e --arg source "$GITHUB_SHA" --arg version "${tag#v}" --arg run "$GITHUB_RUN_ID" \
+             '.source == $source and .version == $version and .run_id == $run' provenance-mac-arm64.json)
+          notes="D2 internal macOS qualification only. GitHub Actions run $GITHUB_RUN_ID. Source $GITHUB_SHA. Ad hoc signing."
+          gh release create "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" \
+            --draft --target "$GITHUB_SHA" --title "Sapiens4 D2 QA ${tag#v}" --notes "$notes"
+
+  promote:
+    if: github.repository == 'PoulWalcker/sapien4s' && startsWith(github.ref_name, 'codex/d2-publish-v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Promote only the requested version through GitHub Releases API
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#codex/d2-publish-}
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -ce --arg tag "$tag" '[.[] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("Expected one release") end')
+          jq -e --arg sha "$GITHUB_SHA" '
+            .draft and .target_commitish == $sha and
+            (.assets | map(select(.state == "uploaded" and (.digest | type == "string") and (.digest | test("^sha256:[0-9a-f]{64}$"))) | .name) | sort ==
+            ["SHA256SUMS-mac-arm64", "Sapiens-Payload-mac-arm64.dmg", "Sapiens.dmg", "provenance-mac-arm64.json"])' <<< "$release"
+          id=$(jq -r .id <<< "$release")
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F draft=false -F prerelease=false -f make_latest=true \
+            --jq '{tag_name, draft, prerelease, html_url}'
