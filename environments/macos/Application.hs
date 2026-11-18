@@ -390,7 +390,7 @@ initialize application target address = do
     void (obj1 container "addSubview:" view)
     win <- allocated "NSWindow" >>= \o -> window o 1180 820 15
     writeIORef (windowRef application) win
-    setText win "setTitle:" (if fixture application then "Sapiens4 behavior fixture" else "Sapiens4")
+    setText win "setTitle:" (if fixture application then "Sapiens4 behavior fixture" else "Sapiens4 QA 3.0.0")
     void (obj1 win "setContentView:" container); void (obj1 win "setReleasedWhenClosed:" (int 0))
     void (obj0 win "center")
     unless (fixture application) $ do
